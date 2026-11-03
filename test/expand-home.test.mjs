@@ -40,7 +40,7 @@ function helper(name) {
  * dependency would throw here instead of silently testing nothing.
  */
 const { childPath, expandHomePrefix, insideWorkspace, editorStatusKey, editorHintKey } = new Function(
-  `${helper("childPath")}\n${helper("isWindowsRoot")}\n${helper("pathParts")}\n${helper("expandHomePrefix")}\n${helper("slashRootBase")}\n${helper("insideWorkspace")}\n${helper("editorStatusKey")}\n${helper("editorHintKey")}\nreturn { childPath, expandHomePrefix, insideWorkspace, editorStatusKey, editorHintKey };`,
+  `${helper("childPath")}\n${helper("isWindowsRoot")}\n${helper("isUncTarget")}\n${helper("pathParts")}\n${helper("expandHomePrefix")}\n${helper("slashRootBase")}\n${helper("insideWorkspace")}\n${helper("editorStatusKey")}\n${helper("editorHintKey")}\nreturn { childPath, expandHomePrefix, insideWorkspace, editorStatusKey, editorHintKey };`,
 )();
 
 /**
@@ -188,6 +188,18 @@ test("the pane agrees with the Host's save gate on both path platforms", () => {
     // share root, which is where its slash-rooted child lives.
     ["win32", "/", "/foo.md", win32Path, "\\\\server\\share\\work"],
     ["win32", "\\\\SERVER\\Share", "/foo.md", win32Path, "\\\\server\\share\\work"],
+    // Repeated leading separators are not a share unless a server and a share
+    // follow: Node reads `//foo.md`, `///work/foo.md` and `//server` against the
+    // working directory's drive, so the pane must use the reported base.
+    ["win32", "C:\\", "//foo.md", win32Path, WIN_CWD],
+    ["win32", "C:\\work", "///work/foo.md", win32Path, WIN_CWD],
+    ["win32", "C:\\work", "//server", win32Path, WIN_CWD],
+    ["win32", "C:\\work", "//work/foo.md", win32Path, WIN_CWD],
+    ["win32", "C:\\work", "//server/foo.md", win32Path, WIN_CWD],
+    // Repeated separators inside a real share root collapse, so the share still
+    // contains its child.
+    ["win32", "\\\\SERVER\\Share", "//server//share/notes/a.md", win32Path, WIN_CWD],
+    ["win32", "\\\\SERVER\\Share", "\\\\server\\\\share\\\\notes\\a.md", win32Path, WIN_CWD],
   ];
   for (const [platform, root, target, api, cwd] of cases) {
     assert.equal(
@@ -196,6 +208,39 @@ test("the pane agrees with the Host's save gate on both path platforms", () => {
       `${platform} ${root} -> ${target}`,
     );
   }
+});
+
+test("a resource address that parses to a double-leading path follows the Host gate", () => {
+  // `dsh-resource://file/session/<id>///foo.md` parses to `//foo.md`, which
+  // Windows reads against the working directory's drive rather than as a share,
+  // so a parsed address can reach the pane in a spelling the matrix only covers
+  // through a bare target.
+  const { parseFileAddress } = new Function(
+    `const FILE_ADDRESS_PREFIX = "dsh-resource://file/";\n${helper("isDriveSegment")}\n${helper("parseFileAddress")}\nreturn { parseFileAddress };`,
+  )();
+  const WIN_CWD = "C:\\service";
+  const base = win32Path.resolve(WIN_CWD, "/");
+
+  const doubled = parseFileAddress("dsh-resource://file/session/s1///foo.md");
+  assert.equal(doubled.path, "//foo.md", "one empty segment pair yields a double-leading target");
+  // One more leading separator reaches the pane as three, which Windows also
+  // reads against the working directory's drive.
+  assert.equal(parseFileAddress("dsh-resource://file/session/s1////foo.md").path, "///foo.md");
+  const target = doubled.path.startsWith("/") ? doubled.path : `/${doubled.path}`;
+  assert.equal(insideWorkspace(target, "C:\\", base), true);
+  assert.equal(insideWorkspace(target, "C:\\", base), hostWritable("C:\\", target, win32Path, WIN_CWD));
+  assert.equal(insideWorkspace(target, "D:\\work", base), false);
+  assert.equal(insideWorkspace(target, "D:\\work", base), hostWritable("D:\\work", target, win32Path, WIN_CWD));
+
+  // A valid UNC resource address still names its share, and a share workspace
+  // contains the child even when the working directory is on a drive.
+  const shared = parseFileAddress("dsh-resource://file/absolute//server/share/notes/a.md");
+  assert.equal(shared.path, "//server/share/notes/a.md");
+  assert.equal(insideWorkspace(shared.path, "\\\\SERVER\\Share", base), true);
+  assert.equal(
+    insideWorkspace(shared.path, "\\\\SERVER\\Share", base),
+    hostWritable("\\\\SERVER\\Share", shared.path, win32Path, WIN_CWD),
+  );
 });
 
 test("a traversal segment cannot walk a path out of the workspace", () => {

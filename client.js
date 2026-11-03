@@ -120,22 +120,37 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Whether a Windows target carries a UNC share root of its own. Node calls a
+     * path UNC only when it starts with exactly two separators and names both a
+     * server and a share: `//server/share/x` is a share, while `//foo.md`,
+     * `///foo.md` and `//server` have no share and resolve against the process
+     * working directory's drive instead. Repeated separators inside the root are
+     * collapsed, so `//server//share/x` still names that share.
+     */
+    function isUncTarget(path) {
+      const slashed = path.replace(/\\/g, "/");
+      if (!slashed.startsWith("//") || slashed.startsWith("///")) return false;
+      return slashed.split("/").filter((part) => part !== "").length >= 2;
+    }
+
+    /**
      * Collapse one absolute path to its root and segments. `.` and `..` are
      * resolved first, because the Host resolves before it compares. A root of
      * `/` is the POSIX root; a Windows root carries its drive letter or share,
      * because the Host answers with the resolved form. A drive root carries no
-     * trailing separator, so `C:\` and `C:\x` line up. A single-leading-slash
-     * path on Windows carries no drive of its own: `path.resolve` reads it
+     * trailing separator, so `C:\` and `C:\x` line up. A rooted path on Windows
+     * without a UNC share of its own carries no drive: `path.resolve` reads it
      * against the root of the process working directory's drive or share, so
      * `rootBase` names that root. The file pane builds children that way from a
-     * Session whose recorded workspace is `/`, and an absolute resource address
-     * arrives in the same spelling. On Windows every segment folds to lower
+     * Session whose recorded workspace is `/`, and a resource address arrives in
+     * the same spelling, including the repeated-leading-slash forms Windows
+     * still reads against that drive. On Windows every segment folds to lower
      * case, the way `path.win32.relative` compares; a POSIX path keeps its case.
      */
     function pathParts(path, windows, rootBase) {
       const slashed = path.replace(/\\/g, "/");
       const drive = /^([A-Za-z]):(?:\/|$)/.exec(slashed);
-      const share = windows ? /^\/\/([^/]+)\/([^/]+)(?:\/|$)/.exec(slashed) : null;
+      const share = windows ? /^\/\/([^/]+)\/+([^/]+)(?:\/+|$)/.exec(slashed) : null;
       let root = "/";
       let rest = slashed;
       if (drive !== null) {
@@ -170,14 +185,14 @@ window.__ModuleLoader__.load({
      * descendant of it. A root of `/` therefore contains every descendant, and
      * the root itself is refused, exactly as the save route refuses it. The
      * comparison folds case only when the root is spelled the Windows way,
-     * matching the platform whose `path.relative` the Host will use. A
-     * slash-rooted target carries no drive, and `path.resolve` reads it against
-     * the root of the Host process working directory's drive or share, so
-     * `resolveBase` (that root, as the Host reports it) decides which one it
-     * belongs to; without that answer the pane cannot tell, and stays read-only.
-     * Reading it against the workspace root's own drive instead would call a
-     * target writable that the Host refuses on a Host whose working directory
-     * sits on another drive or share.
+     * matching the platform whose `path.relative` the Host will use. A rooted
+     * target without a UNC share of its own carries no drive, and `path.resolve`
+     * reads it against the root of the Host process working directory's drive or
+     * share, so `resolveBase` (that root, as the Host reports it) decides which
+     * one it belongs to; without that answer the pane cannot tell, and stays
+     * read-only. Reading it against the workspace root's own drive instead would
+     * call a target writable that the Host refuses on a Host whose working
+     * directory sits on another drive or share.
      */
     function insideWorkspace(path, root, resolveBase) {
       if (typeof root !== "string" || root === "" || typeof path !== "string" || path === "") return false;
@@ -189,14 +204,18 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * The root token a slash-rooted target carries on Windows, taken from the
-     * Host's reported base. A target with a drive letter or a share of its own
-     * needs none, and a target the Host has not been asked about gets `undefined`
-     * so `pathParts` keeps the POSIX root and the comparison refuses it.
+     * The root token a rooted Windows target without a share of its own carries,
+     * taken from the Host's reported base. A target with a drive letter, a valid
+     * server and share, or no leading separator at all needs none; the repeated
+     * leading separators Windows still reads against the drive root are included,
+     * because Node only treats exactly two as a share when a share follows. A
+     * target the Host has not been asked about gets `undefined`, so `pathParts`
+     * keeps the POSIX root and the comparison refuses it.
      */
     function slashRootBase(path, resolveBase) {
+      if (isUncTarget(path)) return undefined;
       const spelled = path.replace(/\\/g, "/");
-      if (!spelled.startsWith("/") || spelled.charAt(1) === "/") return undefined;
+      if (!spelled.startsWith("/")) return undefined;
       if (typeof resolveBase !== "string" || resolveBase === "") return undefined;
       return pathParts(resolveBase, true).root;
     }
