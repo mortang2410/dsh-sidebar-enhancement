@@ -188,12 +188,23 @@ test("an unknown root or target is never treated as writable", () => {
 
 test("the editor wires the Host-resolved workspace root into the writable decision", () => {
   // The pure-helper tests above cannot fail if the component stops calling
-  // them, so the wiring is pinned here: the root comes from the Host lookup
-  // (which carries the no-cwd fallback), never from the session summary alone.
+  // them, so the wiring is pinned here: the root comes from the Host lookup,
+  // never from the session summary, and a relative address waits for it.
   const body = source.slice(source.indexOf("function EditorBody("));
-  assert.match(body, /useWorkspaceRoot\(useSessions, fileSessionId, face\)/);
+  assert.match(body, /useWorkspaceRoot\(fileSessionId, face\)/);
   assert.match(body, /insideWorkspace\(absPath, root\)/);
+  assert.match(body, /if \(!rootSettled\) return undefined;/);
   assert.doesNotMatch(body, /byId\[fileSessionId\]\?\.cwd/);
+});
+
+test("the Host answers a Windows / root with the drive root before the pane compares", () => {
+  // `path.win32.resolve` turns a raw `/` into the current drive's root, which
+  // is what the Host save gate resolves it to. The pane never sees the raw
+  // spelling, and accepts a drive-qualified descendant of the resolved root.
+  assert.equal(win32Path.resolve("C:\\work", "/"), "C:\\");
+  const root = win32Path.resolve("C:\\work", "/");
+  assert.equal(insideWorkspace("C:\\file.txt", root), true);
+  assert.equal(insideWorkspace("C:\\file.txt", root), hostWritable(root, "C:\\file.txt", win32Path));
 });
 
 test("a root resolved for one Session never stands in for another", async () => {
@@ -211,31 +222,33 @@ test("a root resolved for one Session never stands in for another", async () => 
     useEffect: (fn) => { effectSlots.push(fn); },
   };
   const hook = new Function("React", `${helper("useWorkspaceRoot")}\nreturn useWorkspaceRoot;`)(React);
-  const sessions = { byId: { A: {}, B: {} } };
-  const useSessions = (selector) => selector(sessions);
   const answers = [];
   const face = { workspaceRoot: () => new Promise((resolve) => { answers.push(resolve); }) };
   const render = (sessionId) => {
     slot = 0;
     effectSlots = [];
-    const root = hook(useSessions, sessionId, face);
+    const state = hook(sessionId, face);
     for (const start of effectSlots) start();
-    return root;
+    return state;
   };
   const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(render("A"), undefined, "no root before the Host answers");
+  const first = render("A");
+  assert.equal(first.root, undefined, "no root before the Host answers");
+  assert.equal(first.settled, false, "an unanswered lookup has not settled");
   answers.pop()({ ok: true, value: { workspaceRoot: "/work/projectA" } });
   await settle();
-  assert.equal(render("A"), "/work/projectA");
+  assert.deepEqual(render("A"), { root: "/work/projectA", settled: true });
 
-  assert.equal(render("B"), undefined, "A's root must not answer for B");
+  const forB = render("B");
+  assert.equal(forB.root, undefined, "A's root must not answer for B");
+  assert.equal(forB.settled, false, "B's lookup is still pending");
   const answerForB = answers.pop();
   // The stale root is the dangerous state, so check it before and after a failure.
-  assert.equal(render("B"), undefined);
+  assert.equal(render("B").root, undefined);
   answerForB({ ok: false, error: { code: "network", message: "unreachable" } });
   await settle();
-  assert.equal(render("B"), undefined, "a failed lookup leaves B without a root");
+  assert.deepEqual(render("B"), { root: undefined, settled: true }, "a failed lookup settles with no root");
 });
 
 test("the status line never reports an edit for a read-only target", () => {

@@ -79,7 +79,7 @@ dsh plugin --profile web remove dsh-sidebar-enhancement
 
 ## 工作原理 / How it works
 
-- **Host 半部**（`index.js`）向 DSH 内置 web 服务器注册 10 条路由：6 条变更路由（`/sidebar-enhancer/{save,create,mkdir,rename,remove,upload}`）、1 条读取路由（`/sidebar-enhancer/download`，GET）、2 条命令库路由（`/sidebar-enhancer/quick/{load,save}`）与 1 条工作区根查询路由（`/sidebar-enhancer/scope`，POST，只回答该会话生效的工作区根）。变更路由经过连接信任围栏、`typert` 会话工作区根解析与路径包含检查，另有有界请求体，文件读写经由 `ctx.fs`（乐观锁 `writeText`），目录操作走 `node:fs/promises`。命令库路由按用户级状态处理：不需要 Session，校验文档形状后用「临时文件 + rename」原子改写。工作区根查询路由同样经过信任围栏与 `typert` 解析，不接受路径参数，只回答保存路由本来就要用来限制写入的那个根（会话头部记录的 `cwd`，缺失时回落沙箱工作区根），因此编辑器判断某个文件能否保存时，与本插件的保存闸门用的是同一个根。
+- **Host 半部**（`index.js`）向 DSH 内置 web 服务器注册 10 条路由：6 条变更路由（`/sidebar-enhancer/{save,create,mkdir,rename,remove,upload}`）、1 条读取路由（`/sidebar-enhancer/download`，GET）、2 条命令库路由（`/sidebar-enhancer/quick/{load,save}`）与 1 条工作区根查询路由（`/sidebar-enhancer/scope`，POST，只回答该会话生效的工作区根）。变更路由经过连接信任围栏、`typert` 会话工作区根解析与路径包含检查，另有有界请求体，文件读写经由 `ctx.fs`（乐观锁 `writeText`），目录操作走 `node:fs/promises`。命令库路由按用户级状态处理：不需要 Session，校验文档形状后用「临时文件 + rename」原子改写。工作区根查询路由同样经过信任围栏与 `typert` 解析，不接受路径参数，只回答保存路由本来就要用来限制写入的那个根（会话头部记录的 `cwd`，缺失时回落沙箱工作区根；并按 `path.resolve` 归一，所以 Windows 下记录为 `/` 的会话得到的是当前盘符根），因此编辑器判断某个文件能否保存时，与本插件的保存闸门用的是同一个根。
 - **下载**：`download` 路由只读，文件按原字节回传（`Content-Disposition` 带 UTF-8 文件名，非 ASCII 文件名不乱码）；目录在内存中打包为 ZIP——自实现最小 ZIP 写出器（`node:zlib` 压缩 + 自建 CRC-32 表），不进依赖。上限：单文件 256 MB、单次打包 4000 个条目 / 256 MB 未压缩总量，超出即报错而不偷偷截断；打包时**跳过符号链接**，链接无法把工作区外的文件带进压缩包。
 - **复制完整路径**：纯客户端实现（`navigator.clipboard`，非安全上下文回退 `execCommand`），路径按平台风格归一（Windows 反斜杠），结果以提示条回显。
 - **Client 半部**（`client.js`）以 `priority: -1` 影子替换内置文件面板 Slot，并向 `documentPreviews` 注册 `priority: 'extension'` 的渲染器定义与对应文档 Slot。读取走内置 `workspaceFiles` Remote（分页 1 基行号），写入走上述 Host 路由。

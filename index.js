@@ -928,7 +928,10 @@ export function apply(ctx, config) {
         sendJson(res, 404, failure('unknown-workspace', 'unknown session workspace'));
         return;
       }
-      sendJson(res, 200, { ok: true, workspaceRoot: scope.workspaceRoot });
+      // The same normalization `resolveInside` applies to the root before it
+      // compares: a Windows Session recorded as `/` means the current drive's
+      // root, and only this side knows which drive that is.
+      sendJson(res, 200, { ok: true, workspaceRoot: path.resolve(scope.workspaceRoot) });
     },
   };
   const scopeHandler = makeBodyHandler(ctx, scopeRoute);

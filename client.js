@@ -122,10 +122,11 @@ window.__ModuleLoader__.load({
     /**
      * Collapse one absolute path to its root and segments. `.` and `..` are
      * resolved first, because the Host resolves before it compares. A root of
-     * `/` covers a POSIX path and also a Windows path under the current drive;
-     * a drive root carries no trailing separator, so `C:\` and `C:\x` line up.
-     * On Windows every segment folds to lower case, the way `path.win32.relative`
-     * compares; a POSIX path keeps its case.
+     * `/` is the POSIX root; a Windows root always carries its drive letter or
+     * share, because the Host answers with the resolved form. A drive root
+     * carries no trailing separator, so `C:\` and `C:\x` line up. On Windows
+     * every segment folds to lower case, the way `path.win32.relative` compares;
+     * a POSIX path keeps its case.
      */
     function pathParts(path, windows) {
       const slashed = path.replace(/\\/g, "/");
@@ -2148,34 +2149,33 @@ button.dse-qcName{cursor:pointer}
     ];
 
     /**
-     * The workspace root the Host confines one Session's writes to. The Session
-     * summary carries the root as `cwd`; when it carries none the Host resolves
-     * its own fallback instead (`header.cwd ?? sandboxPolicy.workspaceRoot` in
-     * `dsh-api-workspace-files`), so the pane asks for that resolved root rather
-     * than assuming every target is outside. An unknown root stays `undefined`
-     * and the editor treats the target as not writable.
+     * The workspace root the Host confines one Session's writes to, as the Host
+     * resolves it, plus whether that answer has arrived. The answer is always
+     * taken from the Host, never from the Session summary: a summary `cwd` is
+     * the raw recorded spelling, and a Windows Session recorded as `/` means
+     * that machine's current drive root, which only the Host can name. The
+     * lookup is keyed by Session, so a root answered for one Session is never
+     * used for another. Until it answers, `settled` is false and `root` is
+     * `undefined`; a failed lookup settles with no root, which the editor
+     * treats as not writable.
      */
-    function useWorkspaceRoot(useSessions, sessionId, face) {
-      const cwd = useSessions((sessions) => sessions.byId[sessionId]?.cwd);
+    function useWorkspaceRoot(sessionId, face) {
       const [lookup, setLookup] = React.useState(undefined);
       React.useEffect(() => {
-        if (cwd !== undefined) return undefined;
         let live = true;
+        const settle = (root) => {
+          if (live) setLookup({ sessionId, root });
+        };
         face.workspaceRoot().then(
-          (reply) => {
-            if (live && reply.ok === true && typeof reply.value.workspaceRoot === "string") {
-              setLookup({ sessionId, root: reply.value.workspaceRoot });
-            }
-          },
-          () => undefined,
+          (reply) => settle(reply.ok === true && typeof reply.value.workspaceRoot === "string" ? reply.value.workspaceRoot : undefined),
+          () => settle(undefined),
         );
         return () => {
           live = false;
         };
-      }, [cwd, sessionId, face]);
-      if (cwd !== undefined) return cwd;
-      /** A root answered for another Session is not this Session's root. */
-      return lookup !== undefined && lookup.sessionId === sessionId ? lookup.root : undefined;
+      }, [sessionId, face]);
+      const settled = lookup !== undefined && lookup.sessionId === sessionId;
+      return { root: settled ? lookup.root : undefined, settled };
     }
 
     /**
@@ -2189,11 +2189,11 @@ button.dse-qcName{cursor:pointer}
      * confined to that workspace, so a target outside it is shown read-only
      * instead of offering an edit whose save the Host refuses.
      */
-    function EditorBody({ sessionId, useSessions, useHostHome, t, content, wrap, resourceAddress, scrollportRef, makeFace }) {
+    function EditorBody({ sessionId, useHostHome, t, content, wrap, resourceAddress, scrollportRef, makeFace }) {
       const parsed = React.useMemo(() => parseFileAddress(resourceAddress), [resourceAddress]);
       const fileSessionId = parsed !== undefined && parsed.scope === "session" ? parsed.sessionId : sessionId;
       const face = React.useMemo(() => makeFace(fileSessionId), [makeFace, fileSessionId]);
-      const root = useWorkspaceRoot(useSessions, fileSessionId, face);
+      const { root, settled: rootSettled } = useWorkspaceRoot(fileSessionId, face);
       const home = useHostHome();
       const absPath = React.useMemo(() => {
         if (parsed === undefined || parsed.scope !== "session") return undefined;
@@ -2250,6 +2250,10 @@ button.dse-qcName{cursor:pointer}
         const owner = contentRef.current;
         if (owner === undefined || owner.kind !== "renderer") return undefined;
         if (absPath === undefined) {
+          // A relative address is resolved against the root the Host answers
+          // with, so until that answer arrives the address is not yet known to
+          // be unresolvable; this effect runs again when it settles.
+          if (!rootSettled) return undefined;
           setPhase("error");
           setNote({ kind: "error", text: t("editor.loadFailed", { message: t("error.unavailable", { message: "unknown file address" }) }) });
           owner.failed?.();
@@ -2280,7 +2284,7 @@ button.dse-qcName{cursor:pointer}
           cancelled = true;
           controller.abort();
         };
-      }, [revision, absPath, face, t, applyLoaded]);
+      }, [revision, absPath, face, t, applyLoaded, rootSettled]);
 
       /** Save the textarea's text; on a version conflict, confirm and force. */
       const save = React.useCallback(async (force) => {
