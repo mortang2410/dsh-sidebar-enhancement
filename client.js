@@ -91,6 +91,23 @@ window.__ModuleLoader__.load({
       return `${parent.replace(/[/\\]+$/, "")}/${name}`;
     }
 
+    /**
+     * Expand a leading home shorthand against the Host home directory, so an
+     * address written as `~/dir/file` becomes an absolute path here. Every
+     * layer below takes the string literally, so without this the tilde
+     * survives into the joined path and names a directory that does not exist.
+     * A user name (`~other/file`), an interior tilde (`a/~/b`), and the case
+     * where the home directory is still unknown are returned unchanged: none of
+     * them names this Host's home directory.
+     */
+    function expandHomePrefix(path, home) {
+      if (typeof home !== "string" || (path !== "~" && !path.startsWith("~/"))) return path;
+      const base = home.replace(/\\/g, "/").replace(/\/+$/, "");
+      if (base === "") return path;
+      const rest = path.slice(1).replace(/^\/+/, "");
+      return rest === "" ? base : childPath(base, rest);
+    }
+
     /** The final path segment, whatever separator spelling the path uses. */
     function baseName(path) {
       const parts = String(path).split(/[/\\]+/).filter((part) => part !== "");
@@ -639,6 +656,25 @@ window.__ModuleLoader__.load({
     }
 
     //#endregion
+
+    /**
+     * The Host home directory, as the Browser receives it. A file address
+     * written as `~/dir/file` names that directory, and no layer below the
+     * editor expands it, so the editor needs the value itself. Unknown until
+     * the connection carries Host facts, and re-read whenever the connection
+     * resets, which is the only moment the value can change.
+     */
+    function hostHomeSource(ctx) {
+      return {
+        getSnapshot: () => {
+          const remote = ctx.remote;
+          const facts = remote === undefined ? undefined : remote.$host;
+          return facts === undefined ? undefined : facts.home;
+        },
+        subscribe: (listener) =>
+          typeof ctx.on === "function" ? ctx.on("connection/reset", listener) : () => {},
+      };
+    }
 
     //#region styles
 
@@ -2033,18 +2069,19 @@ button.dse-qcName{cursor:pointer}
      * Renderer-contract versioning is honored: `content.loaded(version)` after a
      * settled read or save, `content.failed()` when the file cannot be read.
      */
-    function EditorBody({ sessionId, useSessions, t, content, wrap, resourceAddress, scrollportRef, makeFace }) {
+    function EditorBody({ sessionId, useSessions, useHostHome, t, content, wrap, resourceAddress, scrollportRef, makeFace }) {
       const parsed = React.useMemo(() => parseFileAddress(resourceAddress), [resourceAddress]);
       const fileSessionId = parsed !== undefined && parsed.scope === "session" ? parsed.sessionId : sessionId;
       const cwd = useSessions((sessions) => sessions.byId[fileSessionId]?.cwd);
+      const home = useHostHome === undefined ? undefined : useHostHome();
       const absPath = React.useMemo(() => {
         if (parsed === undefined || parsed.scope !== "session") return undefined;
-        const raw = parsed.path.replace(/\\/g, "/");
+        const raw = expandHomePrefix(parsed.path.replace(/\\/g, "/"), home);
         if (raw === "") return undefined;
         if (isAbsoluteWorkspacePath(raw)) return raw;
         if (cwd === undefined) return undefined;
         return childPath(cwd, raw);
-      }, [parsed, cwd]);
+      }, [parsed, cwd, home]);
       const face = React.useMemo(() => makeFace(fileSessionId), [makeFace, fileSessionId]);
 
       const [text, setText] = React.useState("");
@@ -3816,7 +3853,10 @@ button.dse-qcName{cursor:pointer}
           name: "sidebar.right.tab.document",
           key: EDITOR_ID,
           locale: NS,
-          inject: (sessionId) => ({ makeFace: (id) => makeFace(ctx, id ?? sessionId) }),
+          inject: (sessionId) => ({
+            makeFace: (id) => makeFace(ctx, id ?? sessionId),
+            useHostHome: selectorHookFor(hostHomeSource(ctx)),
+          }),
         }, EditorBody)), "sidebar-enhancement: editable document body");
       }
 
