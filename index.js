@@ -27,6 +27,14 @@ const UPLOAD_PATH = '/sidebar-enhancer/upload';
 /** Read route: a GET the browser streams a file or directory archive from. */
 const DOWNLOAD_PATH = '/sidebar-enhancer/download';
 /**
+ * Workspace-root lookup. The client decides whether the editor may save, and
+ * the Host resolves a Session's root as `header.cwd ?? sandboxPolicy.workspaceRoot`
+ * (`dsh-api-workspace-files`); a Session the session list carries without a
+ * `cwd` therefore needs the resolved fallback, or the pane refuses a save the
+ * Host would accept.
+ */
+const SCOPE_PATH = '/sidebar-enhancer/scope';
+/**
  * Quick-command library routes. This state belongs to the user, not to a
  * Session workspace: it lives in one JSON file under the harness home, so the
  * library survives a restart, a changed port, and a different browser — all of
@@ -798,15 +806,16 @@ async function writeQuickDocument(document) {
 }
 
 /**
- * Build one library handler: trust fence → POST → content type → bounded body
- * → JSON. Unlike the workspace routes this one needs no Session: the library is
- * user-level state, and the fence already proves the caller is this harness's
- * own page.
+ * Build one JSON-body handler: trust fence → POST → content type → bounded body
+ * → JSON. It serves the routes whose request carries no workspace path: the
+ * quick-command library, which is user-level state, and the workspace-root
+ * lookup, which takes its Session from the body. The fence already proves the
+ * caller is this harness's own page.
  *
  * @param {object} ctx
  * @param {{maxBytes: number, run: (body: any, res: any) => Promise<void>}} spec
  */
-function makeLibraryHandler(ctx, spec) {
+function makeBodyHandler(ctx, spec) {
   return async (req, res) => {
     const rejection = connectionOf(ctx).requestRejection(req);
     if (rejection !== void 0) {
@@ -899,9 +908,31 @@ export function apply(ctx, config) {
     [QUICK_SAVE_PATH, LIBRARY_SPECS.save],
   ];
   for (const [routePath, spec] of libraryRoutes) {
-    const handler = makeLibraryHandler(ctx, spec);
+    const handler = makeBodyHandler(ctx, spec);
     ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: routePath, handler }), `sidebar-enhancement: ${routePath}`);
   }
+
+  // The effective workspace root for one Session, resolved through the same
+  // `workspaceFileScope` lookup every write route uses, so the pane and the
+  // Host cannot disagree about which root a save is confined to.
+  const scopeRoute = {
+    maxBytes: 8 * 1024,
+    run: async (body, res) => {
+      const sessionId = asNonEmptyString(body.sessionId);
+      if (sessionId === null) {
+        sendJson(res, 400, failure('invalid-request', 'sessionId is required'));
+        return;
+      }
+      const scope = await scopeOf(ctx, sessionId);
+      if (scope === undefined) {
+        sendJson(res, 404, failure('unknown-workspace', 'unknown session workspace'));
+        return;
+      }
+      sendJson(res, 200, { ok: true, workspaceRoot: scope.workspaceRoot });
+    },
+  };
+  const scopeHandler = makeBodyHandler(ctx, scopeRoute);
+  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: SCOPE_PATH, handler: scopeHandler }), `sidebar-enhancement: ${SCOPE_PATH}`);
 }
 
 export const inject = ['webServer', 'connection', 'fs', 'typert', 'sessions', 'sandboxPolicy'];

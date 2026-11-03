@@ -103,10 +103,21 @@ test("the pre-fix join is what the fix replaces", () => {
 
 test("a target inside the workspace counts as writable, one outside does not", () => {
   assert.equal(insideWorkspace("/home/wilder/.dsh/notes/a.md", CWD), true);
-  assert.equal(insideWorkspace(CWD, CWD), true);
   assert.equal(insideWorkspace("/home/wilder/Trash/a.md", CWD), false);
   assert.equal(insideWorkspace("/home/wilder/.dshother/a.md", CWD), false);
   assert.equal(insideWorkspace("/home/wilder/.dsh/a.md", `${CWD}/`), true);
+});
+
+test("the root itself is not writable, because the Host's save gate refuses it", () => {
+  // `resolveInside` rejects an empty relative path, so the pane must agree.
+  assert.equal(insideWorkspace(CWD, CWD), false);
+});
+
+test("a Windows case variant of an in-workspace path stays writable", () => {
+  // The Host compares with `path.relative`, which folds case on win32.
+  assert.equal(insideWorkspace("c:\\users\\wilder\\.dsh\\notes\\a.md", "C:\\Users\\Wilder\\.dsh"), true);
+  assert.equal(insideWorkspace("C:/Users/Wilder/.dsh/notes/a.md", "c:/users/wilder/.dsh"), true);
+  assert.equal(insideWorkspace("c:\\users\\wilder\\.dshother\\a.md", "C:\\Users\\Wilder\\.dsh"), false);
 });
 
 test("a traversal segment cannot walk a path out of the workspace", () => {
@@ -118,8 +129,10 @@ test("a traversal segment cannot walk a path out of the workspace", () => {
   assert.equal(normalizeAbsolutePath(`${CWD}//a/./b/../c.md`), `${CWD}/a/c.md`);
 });
 
-test("a root of / is refused rather than treating every path as writable", () => {
-  assert.equal(insideWorkspace("/home/wilder/a.md", "/"), false);
+test("a root of / contains every descendant, the way the Host gate does", () => {
+  // `path.relative("/", "/home/wilder/a.md")` is a plain relative path, so the
+  // Host save route accepts it; the pane must not claim a target is read-only.
+  assert.equal(insideWorkspace("/home/wilder/a.md", "/"), true);
   assert.equal(insideWorkspace("/home/wilder/a.md", ""), false);
 });
 
@@ -127,6 +140,17 @@ test("an unknown root or target is never treated as writable", () => {
   assert.equal(insideWorkspace(undefined, CWD), false);
   assert.equal(insideWorkspace("/home/wilder/.dsh/a.md", undefined), false);
   assert.equal(insideWorkspace("/a.md", ""), false);
+  assert.equal(insideWorkspace("", CWD), false);
+});
+
+test("the editor wires the Host-resolved workspace root into the writable decision", () => {
+  // The pure-helper tests above cannot fail if the component stops calling
+  // them, so the wiring is pinned here: the root comes from the Host lookup
+  // (which carries the no-cwd fallback), never from the session summary alone.
+  const body = source.slice(source.indexOf("function EditorBody("));
+  assert.match(body, /useWorkspaceRoot\(useSessions, fileSessionId, face\)/);
+  assert.match(body, /insideWorkspace\(absPath, root\)/);
+  assert.doesNotMatch(body, /byId\[fileSessionId\]\?\.cwd/);
 });
 
 test("the status line never reports an edit for a read-only target", () => {

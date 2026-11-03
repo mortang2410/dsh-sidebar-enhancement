@@ -54,6 +54,8 @@ window.__ModuleLoader__.load({
       rename: "/sidebar-enhancer/rename",
       remove: "/sidebar-enhancer/remove",
       upload: "/sidebar-enhancer/upload",
+      /** The effective workspace root the Host resolves for one Session. */
+      scope: "/sidebar-enhancer/scope",
       /** Read route: a GET the browser turns into a blob download. */
       download: "/sidebar-enhancer/download",
     };
@@ -128,15 +130,28 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Whether an absolute path sits inside one workspace root. Reads are not
+     * Whether the Host's write routes accept this target. Reads are not
      * confined to the workspace, but every write route is, so the editor needs
      * this to know which of the two it is showing.
+     *
+     * This reproduces the Host's own gate rather than approximating it: the
+     * Host resolves both sides and then compares them with the platform's
+     * `path.relative` (`fs.contains` in `dsh-fs-local`). Two consequences drive
+     * this shape. On Windows that comparison is case-insensitive, so a case
+     * variant of a path inside the workspace is still inside. And the root
+     * itself is refused, because the relative path there is empty, exactly as
+     * the save route refuses it.
      */
     function insideWorkspace(path, root) {
+      if (typeof root !== "string" || root === "" || typeof path !== "string" || path === "") return false;
       const target = normalizeAbsolutePath(path);
       const base = normalizeAbsolutePath(root);
-      if (target === undefined || base === undefined || base === "/") return false;
-      return target === base || target.startsWith(`${base}/`);
+      if (target === undefined || base === undefined) return false;
+      const windowsFold = (value) => (/^\/[A-Za-z]:\//.test(value) ? value.toLowerCase() : value);
+      const inside = windowsFold(target);
+      const basePath = windowsFold(base);
+      if (inside === basePath) return false;
+      return basePath === "/" || inside.startsWith(`${basePath}/`);
     }
 
     /** The status word for one editor state. A read-only target never reports a pending edit. */
@@ -482,6 +497,8 @@ window.__ModuleLoader__.load({
         rename: (from, to) => route(ROUTES.rename, { from, to }),
         remove: (path) => route(ROUTES.remove, { path }),
         upload: (path, bytes, overwrite, signal) => route(ROUTES.upload, { path, data: bytesToBase64(bytes), overwrite }, signal),
+        /** The workspace root the Host confines this Session's writes to. */
+        workspaceRoot: (signal) => route(ROUTES.scope, {}, signal),
         /** The GET URL that hands one path back as a file (directories as a ZIP). */
         downloadUrl: (path) =>
           `${ROUTES.download}?sessionId=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path)}`,
@@ -2111,6 +2128,33 @@ button.dse-qcName{cursor:pointer}
     ];
 
     /**
+     * The workspace root the Host confines one Session's writes to. The Session
+     * summary carries the root as `cwd`; when it carries none the Host resolves
+     * its own fallback instead (`header.cwd ?? sandboxPolicy.workspaceRoot` in
+     * `dsh-api-workspace-files`), so the pane asks for that resolved root rather
+     * than assuming every target is outside. An unknown root stays `undefined`
+     * and the editor treats the target as not writable.
+     */
+    function useWorkspaceRoot(useSessions, sessionId, face) {
+      const cwd = useSessions((sessions) => sessions.byId[sessionId]?.cwd);
+      const [fallback, setFallback] = React.useState(undefined);
+      React.useEffect(() => {
+        if (cwd !== undefined) return undefined;
+        let live = true;
+        face.workspaceRoot().then(
+          (reply) => {
+            if (live && reply.ok === true && typeof reply.value.workspaceRoot === "string") setFallback(reply.value.workspaceRoot);
+          },
+          () => undefined,
+        );
+        return () => {
+          live = false;
+        };
+      }, [cwd, face]);
+      return cwd === undefined ? fallback : cwd;
+    }
+
+    /**
      * The editable renderer's body: read the whole file through its face, edit
      * in a textarea, save through the Host route with optimistic concurrency.
      * Renderer-contract versioning is honored: `content.loaded(version)` after a
@@ -2124,23 +2168,19 @@ button.dse-qcName{cursor:pointer}
     function EditorBody({ sessionId, useSessions, useHostHome, t, content, wrap, resourceAddress, scrollportRef, makeFace }) {
       const parsed = React.useMemo(() => parseFileAddress(resourceAddress), [resourceAddress]);
       const fileSessionId = parsed !== undefined && parsed.scope === "session" ? parsed.sessionId : sessionId;
-      const cwd = useSessions((sessions) => sessions.byId[fileSessionId]?.cwd);
+      const face = React.useMemo(() => makeFace(fileSessionId), [makeFace, fileSessionId]);
+      const root = useWorkspaceRoot(useSessions, fileSessionId, face);
       const home = useHostHome();
       const absPath = React.useMemo(() => {
         if (parsed === undefined || parsed.scope !== "session") return undefined;
         const raw = expandHomePrefix(parsed.path.replace(/\\/g, "/"), home);
         if (raw === "") return undefined;
         if (isAbsoluteWorkspacePath(raw)) return raw;
-        if (cwd === undefined) return undefined;
-        return childPath(cwd, raw);
-      }, [parsed, cwd, home]);
-      /**
-       * Whether the Host's write routes accept this target. They resolve the
-       * same Session workspace root this component reads, and refuse anything
-       * outside it, so an unknown root counts as not writable.
-       */
-      const writable = cwd !== undefined && insideWorkspace(absPath, cwd);
-      const face = React.useMemo(() => makeFace(fileSessionId), [makeFace, fileSessionId]);
+        if (root === undefined) return undefined;
+        return childPath(root, raw);
+      }, [parsed, root, home]);
+      /** Whether the Host's write routes accept this target; an unknown root never does. */
+      const writable = root !== undefined && insideWorkspace(absPath, root);
 
       const [text, setText] = React.useState("");
       const [savedText, setSavedText] = React.useState("");
