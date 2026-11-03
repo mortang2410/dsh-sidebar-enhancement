@@ -5,6 +5,9 @@
   "description": "Enhanced Sidebar files panel: rename, create, upload, download, delete and copy-full-path; an editable document renderer with save; a bottom terminal panel with a quick-command library.",
   "license": "MIT",
   "author": "xmwengxing",
+  "scripts": {
+    "test": "node --test"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/xmwengxing/dsh-sidebar-enhancement.git"

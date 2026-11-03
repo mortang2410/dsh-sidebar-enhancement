@@ -83,13 +83,14 @@ dsh plugin --profile web remove dsh-sidebar-enhancement
 - **下载**：`download` 路由只读，文件按原字节回传（`Content-Disposition` 带 UTF-8 文件名，非 ASCII 文件名不乱码）；目录在内存中打包为 ZIP——自实现最小 ZIP 写出器（`node:zlib` 压缩 + 自建 CRC-32 表），不进依赖。上限：单文件 256 MB、单次打包 4000 个条目 / 256 MB 未压缩总量，超出即报错而不偷偷截断；打包时**跳过符号链接**，链接无法把工作区外的文件带进压缩包。
 - **复制完整路径**：纯客户端实现（`navigator.clipboard`，非安全上下文回退 `execCommand`），路径按平台风格归一（Windows 反斜杠），结果以提示条回显。
 - **Client 半部**（`client.js`）以 `priority: -1` 影子替换内置文件面板 Slot，并向 `documentPreviews` 注册 `priority: 'extension'` 的渲染器定义与对应文档 Slot。读取走内置 `workspaceFiles` Remote（分页 1 基行号），写入走上述 Host 路由。
-- 预览渲染遵循 `DocumentContent` 契约：加载完成后上报 `content.loaded(version)`，外部变更通过 `content.revision` 感知。
+- 预览渲染遵循 `DocumentContent` 契约：加载完成后上报 `content.loaded(version)`，外部变更通过 `content.revision` 感知。文档地址里的前导 `~/` 先用 `remote.$host.home`（浏览器已持有的宿主家目录）展开成绝对路径，再决定是绝对地址还是相对会话工作目录；`~user` 与路径中间的 `~` 保持原样。
 - **快捷命令**：弹窗直接复用宿主 `Modal` 原语（标题栏、遮罩、Esc 关闭、焦点归还都是宿主的），插件只负责卡片尺寸与内部三栏页；命令库是一个模块级 store（`useSyncExternalStore` 订阅，`panelStore` 同款），两个面板读写同一份数据，所以改完切页立即一致。库的权威副本在 Host 文件里：首次打开弹窗时经 `/sidebar-enhancer/quick/load` 拉取（文件为空时把浏览器里的旧数据反向播种进去；文件已有内容时把本机独有的命令并入，两边都不丢），此后每次增改在 400ms 防抖后整体写回；`localStorage` 仍同步写入，用于第一帧就显示出来。**运行**按钮把命令交给面板当前标签的 `TerminalView.write()`（带结尾换行），只在该终端 `connected` 且可写时发送，否则在弹窗右侧说明原因。备份＝把同一份文档另存为 JSON 文件，恢复＝读入文件后走 store 的 `replaceAll`（先确认，再立即写回 Host）。
 - **下侧终端面板**：向 `conversation.composer.dock` 注册多标签面板条目，并向 `conversation.session.header.utilities` 注册头部按钮。面板拥有自己的终端 seat 台账（`panelSeats`）：每个 seat 合成唯一 content identity，直接向 `ctx.webTerminals.view()` 取视图并 `refresh()` 分配新终端；关闭走控制器自己的 `ctx.webTerminals.close(sessionId, key, contentId, terminalId)`（记录关闭意图、清掉绑定与视图、后台结束进程且失败可重试）。不直接调 `view.close()`：它只杀进程，控制器账本仍占着会话终端名额，连续开关后会撞上「终端数量已达上限」。不读取、不写入侧边栏标签清单（`openTabs`/`openTabIn`/`closeIn`），因此与右侧边栏终端完全互不干扰。终端渲染复用内置懒加载分块（`client.terminal.js`，含 xterm）中的 `TerminalBody` 组件与 `webTerminals` 视图模型，不重复实现终端。
 
 ## 兼容性 / Compatibility
 
-- 仅支持会话工作区内的文件（session workspace scope），跨会话与绝对地址不受影响。下载同样受此限制：工作区外的路径返回 403。
+- 文档地址以 `~/` 开头时按宿主家目录展开后再读取，所以工作区外的纯文本文件也能预览；写入仍然只在会话工作区内：工作区外的文件以只读方式展示（没有保存按钮，Ctrl+S 无效），工作区外的保存请求一律 403。下载同样受限：工作区外的路径返回 403。
+  A document address starting with `~/` is expanded against the Host home directory before it is read, so a plain-text file outside the session workspace can be previewed; writes stay confined to that workspace, so an outside file is shown read-only (no save button, Ctrl+S inert) and a save outside the workspace is refused with 403. Downloads are likewise confined: a path outside the workspace returns 403.
 - 下载的目录压缩包不含符号链接（跳过，不跟随）；空目录会保留在包内。
 - 二进制文件、超大文本（读取上限 6M 字符）不进入编辑器，回落内置行为。
 - 目录监视（watch）暂未实现：变更通过手动刷新与操作后自动重列感知。

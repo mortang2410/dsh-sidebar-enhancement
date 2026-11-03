@@ -108,6 +108,49 @@ window.__ModuleLoader__.load({
       return rest === "" ? base : childPath(base, rest);
     }
 
+    /**
+     * Collapse `.` and `..` segments so two spellings of one location compare
+     * equal. The Host resolves a path before it decides containment, so a plain
+     * string prefix test would call `a/../b` inside `a` when it is not.
+     */
+    function normalizeAbsolutePath(path) {
+      if (typeof path !== "string") return undefined;
+      const parts = [];
+      for (const segment of path.replace(/\\/g, "/").split("/")) {
+        if (segment === "" || segment === ".") continue;
+        if (segment === "..") {
+          parts.pop();
+          continue;
+        }
+        parts.push(segment);
+      }
+      return `/${parts.join("/")}`;
+    }
+
+    /**
+     * Whether an absolute path sits inside one workspace root. Reads are not
+     * confined to the workspace, but every write route is, so the editor needs
+     * this to know which of the two it is showing.
+     */
+    function insideWorkspace(path, root) {
+      const target = normalizeAbsolutePath(path);
+      const base = normalizeAbsolutePath(root);
+      if (target === undefined || base === undefined || base === "/") return false;
+      return target === base || target.startsWith(`${base}/`);
+    }
+
+    /** The status word for one editor state. A read-only target never reports a pending edit. */
+    function editorStatusKey(writable, saving, dirty) {
+      if (!writable) return "editor.readOnly";
+      if (saving) return "editor.saving";
+      return dirty ? "editor.dirty" : "editor.clean";
+    }
+
+    /** The hint beside the save button: the shortcut, or why there is no save button. */
+    function editorHintKey(writable) {
+      return writable ? "editor.hint" : "editor.outsideWorkspace";
+    }
+
     /** The final path segment, whatever separator spelling the path uses. */
     function baseName(path) {
       const parts = String(path).split(/[/\\]+/).filter((part) => part !== "");
@@ -943,6 +986,8 @@ button.dse-qcName{cursor:pointer}
       "editor.saveFailed": "保存失败：{message}",
       "editor.loadFailed": "读取失败：{message}",
       "editor.hint": "Ctrl+S 保存",
+      "editor.readOnly": "只读",
+      "editor.outsideWorkspace": "工作区外的文件仅供查看",
       "tool.terminal": "终端面板",
       "panel.hide": "隐藏终端面板",
       "panel.empty": "还没有终端，点右侧 + 新建",
@@ -1086,6 +1131,8 @@ button.dse-qcName{cursor:pointer}
       "editor.saveFailed": "Saving failed: {message}",
       "editor.loadFailed": "Reading failed: {message}",
       "editor.hint": "Ctrl+S to save",
+      "editor.readOnly": "Read-only",
+      "editor.outsideWorkspace": "Outside the workspace: view only",
       "tool.terminal": "Terminal panel",
       "panel.hide": "Hide the terminal panel",
       "panel.empty": "No terminals yet — use + to open one",
@@ -2068,12 +2115,17 @@ button.dse-qcName{cursor:pointer}
      * in a textarea, save through the Host route with optimistic concurrency.
      * Renderer-contract versioning is honored: `content.loaded(version)` after a
      * settled read or save, `content.failed()` when the file cannot be read.
+     *
+     * Reads reach any file the Host can stat, including a target outside the
+     * Session workspace reached through a home shorthand. Every write route is
+     * confined to that workspace, so a target outside it is shown read-only
+     * instead of offering an edit whose save the Host refuses.
      */
     function EditorBody({ sessionId, useSessions, useHostHome, t, content, wrap, resourceAddress, scrollportRef, makeFace }) {
       const parsed = React.useMemo(() => parseFileAddress(resourceAddress), [resourceAddress]);
       const fileSessionId = parsed !== undefined && parsed.scope === "session" ? parsed.sessionId : sessionId;
       const cwd = useSessions((sessions) => sessions.byId[fileSessionId]?.cwd);
-      const home = useHostHome === undefined ? undefined : useHostHome();
+      const home = useHostHome();
       const absPath = React.useMemo(() => {
         if (parsed === undefined || parsed.scope !== "session") return undefined;
         const raw = expandHomePrefix(parsed.path.replace(/\\/g, "/"), home);
@@ -2082,6 +2134,12 @@ button.dse-qcName{cursor:pointer}
         if (cwd === undefined) return undefined;
         return childPath(cwd, raw);
       }, [parsed, cwd, home]);
+      /**
+       * Whether the Host's write routes accept this target. They resolve the
+       * same Session workspace root this component reads, and refuse anything
+       * outside it, so an unknown root counts as not writable.
+       */
+      const writable = cwd !== undefined && insideWorkspace(absPath, cwd);
       const face = React.useMemo(() => makeFace(fileSessionId), [makeFace, fileSessionId]);
 
       const [text, setText] = React.useState("");
@@ -2105,7 +2163,7 @@ button.dse-qcName{cursor:pointer}
       const renderer = content !== undefined && content !== null && content.kind === "renderer";
       const revision = renderer ? content.revision : -1;
       const dirty = text !== savedText;
-      const editable = !(text === "" && savedText === "" && phase !== "ready");
+      const editable = writable && !(text === "" && savedText === "" && phase !== "ready");
 
       /** Adopt one settled read, unless the user edited while it was in flight. */
       const applyLoaded = React.useCallback((loadedText, version, owner) => {
@@ -2162,7 +2220,7 @@ button.dse-qcName{cursor:pointer}
 
       /** Save the textarea's text; on a version conflict, confirm and force. */
       const save = React.useCallback(async (force) => {
-        if (savingRef.current || absPath === undefined) return;
+        if (!writable || savingRef.current || absPath === undefined) return;
         const sent = textRef.current;
         savingRef.current = true;
         setSaving(true);
@@ -2198,7 +2256,7 @@ button.dse-qcName{cursor:pointer}
           savingRef.current = false;
           setSaving(false);
         }
-      }, [absPath, face, t]);
+      }, [absPath, face, t, writable]);
 
       /** Apply the stashed disk version, discarding local edits. */
       const applyPending = React.useCallback(() => {
@@ -2214,19 +2272,21 @@ button.dse-qcName{cursor:pointer}
       }, [pending]);
 
       const onKeyDown = React.useCallback((event) => {
+        if (!writable) return;
         if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && String(event.key).toLowerCase() === "s") {
           event.preventDefault();
           void save(false);
         }
-      }, [save]);
+      }, [save, writable]);
 
       if (!renderer) return null;
 
-      const statusText = saving ? t("editor.saving") : (dirty ? t("editor.dirty") : t("editor.clean"));
+      const statusText = t(editorStatusKey(writable, saving, dirty));
 
       return jsxs("div", {
         className: s.ed,
         "data-enh-editor": phase,
+        "data-enh-readonly": writable ? "false" : "true",
         children: [
           jsxs("div", { className: s.edBar, key: "bar", children: [
             jsx("span", { className: s.dot, "data-dirty": dirty ? "true" : "false", "aria-hidden": true, key: "dot" }),
@@ -2236,8 +2296,8 @@ button.dse-qcName{cursor:pointer}
               jsx("button", { type: "button", className: s.edBtn, onClick: applyPending, children: t("editor.loadDisk") }),
             ] }),
             jsx("span", { className: s.edSpacer, key: "spacer" }),
-            jsx("span", { className: s.edHint, children: t("editor.hint"), key: "hint" }),
-            jsx("button", {
+            jsx("span", { className: s.edHint, children: t(editorHintKey(writable)), key: "hint" }),
+            writable ? jsx("button", {
               type: "button",
               className: s.edBtn,
               disabled: !dirty || saving || absPath === undefined,
@@ -2245,7 +2305,7 @@ button.dse-qcName{cursor:pointer}
               "data-enh-save": true,
               children: saving ? t("editor.saving") : t("editor.save"),
               key: "save",
-            }),
+            }) : null,
           ] }),
           note === null ? null : jsxs("div", { className: s.edNote, "data-kind": note.kind, role: note.kind === "error" ? "alert" : "status", key: "note", children: [
             jsx("span", { children: note.text }),
@@ -3841,6 +3901,11 @@ button.dse-qcName{cursor:pointer}
 
       const previews = ctx.documentPreviews;
       if (previews !== undefined) {
+        // One source for the whole plugin instance: the framework binds and
+        // caches the hook by source identity, so a source minted per inject
+        // call would never be reused. `hooks` is the renderer's documented
+        // channel for this, and it delivers the prop named after the key.
+        const hostHome = hostHomeSource(ctx);
         ctx.effect(() => previews.register({
           id: EDITOR_ID,
           extensions: EDITOR_EXTENSIONS,
@@ -3855,7 +3920,7 @@ button.dse-qcName{cursor:pointer}
           locale: NS,
           inject: (sessionId) => ({
             makeFace: (id) => makeFace(ctx, id ?? sessionId),
-            useHostHome: selectorHookFor(hostHomeSource(ctx)),
+            hooks: { hostHome },
           }),
         }, EditorBody)), "sidebar-enhancement: editable document body");
       }
