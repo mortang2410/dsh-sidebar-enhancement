@@ -125,12 +125,14 @@ window.__ModuleLoader__.load({
      * `/` is the POSIX root; a Windows root carries its drive letter or share,
      * because the Host answers with the resolved form. A drive root carries no
      * trailing separator, so `C:\` and `C:\x` line up. A single-leading-slash
-     * path on Windows is relative to the current drive, so `driveRoot` names the
-     * root it belongs to: the file pane builds children that way from a Session
-     * whose recorded workspace is `/`. On Windows every segment folds to lower
+     * path on Windows carries no drive of its own: `path.resolve` reads it
+     * against the root of the process working directory's drive or share, so
+     * `rootBase` names that root. The file pane builds children that way from a
+     * Session whose recorded workspace is `/`, and an absolute resource address
+     * arrives in the same spelling. On Windows every segment folds to lower
      * case, the way `path.win32.relative` compares; a POSIX path keeps its case.
      */
-    function pathParts(path, windows, driveRoot) {
+    function pathParts(path, windows, rootBase) {
       const slashed = path.replace(/\\/g, "/");
       const drive = /^([A-Za-z]):(?:\/|$)/.exec(slashed);
       const share = windows ? /^\/\/([^/]+)\/([^/]+)(?:\/|$)/.exec(slashed) : null;
@@ -142,8 +144,8 @@ window.__ModuleLoader__.load({
       } else if (share !== null) {
         root = `//${share[1].toLowerCase()}/${share[2].toLowerCase()}`;
         rest = slashed.slice(share[0].length);
-      } else if (driveRoot !== undefined) {
-        root = driveRoot;
+      } else if (rootBase !== undefined) {
+        root = rootBase;
       }
       const segments = [];
       for (const segment of rest.split("/")) {
@@ -168,20 +170,35 @@ window.__ModuleLoader__.load({
      * descendant of it. A root of `/` therefore contains every descendant, and
      * the root itself is refused, exactly as the save route refuses it. The
      * comparison folds case only when the root is spelled the Windows way,
-     * matching the platform whose `path.relative` the Host will use, and a
-     * slash-rooted target under a drive root resolves against that drive, which
-     * is what `path.win32.resolve` does with it. A share root is not a drive, so
-     * there the slash-rooted target keeps the POSIX root and is refused, which
-     * is also what the Host does.
+     * matching the platform whose `path.relative` the Host will use. A
+     * slash-rooted target carries no drive, and `path.resolve` reads it against
+     * the root of the Host process working directory's drive or share, so
+     * `resolveBase` (that root, as the Host reports it) decides which one it
+     * belongs to; without that answer the pane cannot tell, and stays read-only.
+     * Reading it against the workspace root's own drive instead would call a
+     * target writable that the Host refuses on a Host whose working directory
+     * sits on another drive or share.
      */
-    function insideWorkspace(path, root) {
+    function insideWorkspace(path, root, resolveBase) {
       if (typeof root !== "string" || root === "" || typeof path !== "string" || path === "") return false;
       const windows = isWindowsRoot(root);
       const base = pathParts(root, windows);
-      const driveRoot = windows && /^[a-z]:$/.test(base.root) ? base.root : undefined;
-      const target = pathParts(path, windows, driveRoot);
+      const target = pathParts(path, windows, windows ? slashRootBase(path, resolveBase) : undefined);
       if (target.root !== base.root || target.segments.length <= base.segments.length) return false;
       return base.segments.every((segment, index) => target.segments[index] === segment);
+    }
+
+    /**
+     * The root token a slash-rooted target carries on Windows, taken from the
+     * Host's reported base. A target with a drive letter or a share of its own
+     * needs none, and a target the Host has not been asked about gets `undefined`
+     * so `pathParts` keeps the POSIX root and the comparison refuses it.
+     */
+    function slashRootBase(path, resolveBase) {
+      const spelled = path.replace(/\\/g, "/");
+      if (!spelled.startsWith("/") || spelled.charAt(1) === "/") return undefined;
+      if (typeof resolveBase !== "string" || resolveBase === "") return undefined;
+      return pathParts(resolveBase, true).root;
     }
 
     /** The status word for one editor state. A read-only target never reports a pending edit. */
@@ -2159,32 +2176,42 @@ button.dse-qcName{cursor:pointer}
 
     /**
      * The workspace root the Host confines one Session's writes to, as the Host
-     * resolves it, plus whether that answer has arrived. The answer is always
-     * taken from the Host, never from the Session summary: a summary `cwd` is
-     * the raw recorded spelling, and a Windows Session recorded as `/` means
-     * that machine's current drive root, which only the Host can name. The
-     * lookup is keyed by Session, so a root answered for one Session is never
-     * used for another. Until it answers, `settled` is false and `root` is
-     * `undefined`; a failed lookup settles with no root, which the editor
+     * resolves it, plus the root a slash-rooted target resolves against there,
+     * and whether that answer has arrived. The answer is always taken from the
+     * Host, never from the Session summary: a summary `cwd` is the raw recorded
+     * spelling, a Windows Session recorded as `/` means that machine's working
+     * directory drive or share root, and which one only the Host can name. The
+     * lookup is keyed by Session, so an answer for one Session is never used
+     * for another. Until it answers, `settled` is false and both values are
+     * `undefined`; a failed lookup settles with no values, which the editor
      * treats as not writable.
      */
     function useWorkspaceRoot(sessionId, face) {
       const [lookup, setLookup] = React.useState(undefined);
       React.useEffect(() => {
         let live = true;
-        const settle = (root) => {
-          if (live) setLookup({ sessionId, root });
+        const answer = (reply) => {
+          const value = reply !== undefined && reply !== null && reply.ok === true ? reply.value : undefined;
+          const text = (field) => (value !== undefined && value !== null && typeof value[field] === "string" ? value[field] : undefined);
+          return { sessionId, root: text("workspaceRoot"), resolveBase: text("resolveBase") };
+        };
+        const settle = (next) => {
+          if (live) setLookup(next);
         };
         face.workspaceRoot().then(
-          (reply) => settle(reply.ok === true && typeof reply.value.workspaceRoot === "string" ? reply.value.workspaceRoot : undefined),
-          () => settle(undefined),
+          (reply) => settle(answer(reply)),
+          () => settle({ sessionId, root: undefined, resolveBase: undefined }),
         );
         return () => {
           live = false;
         };
       }, [sessionId, face]);
       const settled = lookup !== undefined && lookup.sessionId === sessionId;
-      return { root: settled ? lookup.root : undefined, settled };
+      return {
+        root: settled ? lookup.root : undefined,
+        resolveBase: settled ? lookup.resolveBase : undefined,
+        settled,
+      };
     }
 
     /**
@@ -2202,7 +2229,7 @@ button.dse-qcName{cursor:pointer}
       const parsed = React.useMemo(() => parseFileAddress(resourceAddress), [resourceAddress]);
       const fileSessionId = parsed !== undefined && parsed.scope === "session" ? parsed.sessionId : sessionId;
       const face = React.useMemo(() => makeFace(fileSessionId), [makeFace, fileSessionId]);
-      const { root, settled: rootSettled } = useWorkspaceRoot(fileSessionId, face);
+      const { root, resolveBase, settled: rootSettled } = useWorkspaceRoot(fileSessionId, face);
       const home = useHostHome();
       const absPath = React.useMemo(() => {
         if (parsed === undefined || parsed.scope !== "session") return undefined;
@@ -2213,7 +2240,7 @@ button.dse-qcName{cursor:pointer}
         return childPath(root, raw);
       }, [parsed, root, home]);
       /** Whether the Host's write routes accept this target; an unknown root never does. */
-      const writable = root !== undefined && insideWorkspace(absPath, root);
+      const writable = root !== undefined && insideWorkspace(absPath, root, resolveBase);
 
       const [text, setText] = React.useState("");
       const [savedText, setSavedText] = React.useState("");

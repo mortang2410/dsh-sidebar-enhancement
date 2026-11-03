@@ -929,9 +929,18 @@ export function apply(ctx, config) {
         return;
       }
       // The same normalization `resolveInside` applies to the root before it
-      // compares: a Windows Session recorded as `/` means the current drive's
-      // root, and only this side knows which drive that is.
-      sendJson(res, 200, { ok: true, workspaceRoot: path.resolve(scope.workspaceRoot) });
+      // compares: a Windows Session recorded as `/` means the root of this
+      // process working directory's drive or share, and only this side knows
+      // which one that is. `resolveBase` answers the same question for a
+      // slash-rooted target: it is where `path.resolve` sends a path with no
+      // root of its own, so a target the pane builds as `/foo.txt` from a `/`
+      // workspace, or reads out of an absolute resource address, resolves
+      // against this base rather than against the workspace root's drive.
+      sendJson(res, 200, {
+        ok: true,
+        workspaceRoot: path.resolve(scope.workspaceRoot),
+        resolveBase: path.resolve('/'),
+      });
     },
   };
   const scopeHandler = makeBodyHandler(ctx, scopeRoute);

@@ -40,7 +40,7 @@ function helper(name) {
  * dependency would throw here instead of silently testing nothing.
  */
 const { childPath, expandHomePrefix, insideWorkspace, editorStatusKey, editorHintKey } = new Function(
-  `${helper("childPath")}\n${helper("isWindowsRoot")}\n${helper("pathParts")}\n${helper("expandHomePrefix")}\n${helper("insideWorkspace")}\n${helper("editorStatusKey")}\n${helper("editorHintKey")}\nreturn { childPath, expandHomePrefix, insideWorkspace, editorStatusKey, editorHintKey };`,
+  `${helper("childPath")}\n${helper("isWindowsRoot")}\n${helper("pathParts")}\n${helper("expandHomePrefix")}\n${helper("slashRootBase")}\n${helper("insideWorkspace")}\n${helper("editorStatusKey")}\n${helper("editorHintKey")}\nreturn { childPath, expandHomePrefix, insideWorkspace, editorStatusKey, editorHintKey };`,
 )();
 
 /**
@@ -56,6 +56,16 @@ function hostWritable(root, target, api, cwd) {
   const resolve = (value) => (cwd === undefined ? api.resolve(value) : api.resolve(cwd, value));
   const relative = api.relative(resolve(root), resolve(target));
   return relative !== "" && relative !== ".." && !relative.startsWith(`..${api.sep}`) && !api.isAbsolute(relative);
+}
+
+/**
+ * The root the pane is told a slash-rooted target resolves against. It is the
+ * same answer the Host computes for `path.resolve('/')`: the root of the
+ * working directory's drive or share, so the oracle above and the pane agree
+ * about a target with no drive of its own.
+ */
+function slashBase(api, cwd) {
+  return cwd === undefined ? api.resolve("/") : api.resolve(cwd, "/");
 }
 
 const HOME = "/home/wilder";
@@ -148,7 +158,8 @@ test("a drive root and a share root are compared the way win32 compares them", (
 test("the pane agrees with the Host's save gate on both path platforms", () => {
   // The oracle is `node:path`, the same functions the Host save route uses. A
   // Windows path with no drive of its own resolves against the process working
-  // directory, which `WIN_CWD` stands in for.
+  // directory, which `WIN_CWD` stands in for, and `slashBase` is the root the
+  // Host reports for that resolution.
   const WIN_CWD = "C:\\work";
   const cases = [
     ["posix", "/home/wilder/.dsh", "/home/wilder/.dsh/notes/a.md", posixPath, undefined],
@@ -163,13 +174,27 @@ test("the pane agrees with the Host's save gate on both path platforms", () => {
     ["win32", "\\\\SERVER\\Share", "\\\\server\\share\\notes\\a.md", win32Path, WIN_CWD],
     ["win32", "\\\\SERVER\\Share", "\\\\server\\other\\a.md", win32Path, WIN_CWD],
     // The file pane builds a child of a `/` workspace as `/foo.txt`, which
-    // Windows reads relative to the current drive.
+    // Windows reads against the root of the working directory's drive.
     ["win32", "C:\\", "/foo.txt", win32Path, WIN_CWD],
     ["win32", "C:\\Users\\Wilder\\.dsh", "/foo.txt", win32Path, WIN_CWD],
     ["win32", "\\\\SERVER\\Share", "/foo.txt", win32Path, WIN_CWD],
+    // A slash-rooted target belongs to the working directory's root, never to
+    // the workspace root's drive: on another drive or share the Host refuses
+    // it, so the pane must not call it writable.
+    ["win32", "C:\\work", "/work/foo.md", win32Path, "D:\\service"],
+    ["win32", "C:\\Users\\Wilder\\.dsh", "/Wilder/a.md", win32Path, "D:\\service"],
+    ["win32", "C:\\Users\\Wilder\\.dsh", "/Wilder/a.md", win32Path, "C:\\work"],
+    // A Session recorded as `/` under a UNC working directory resolves to the
+    // share root, which is where its slash-rooted child lives.
+    ["win32", "/", "/foo.md", win32Path, "\\\\server\\share\\work"],
+    ["win32", "\\\\SERVER\\Share", "/foo.md", win32Path, "\\\\server\\share\\work"],
   ];
   for (const [platform, root, target, api, cwd] of cases) {
-    assert.equal(insideWorkspace(target, root), hostWritable(root, target, api, cwd), `${platform} ${root} -> ${target}`);
+    assert.equal(
+      insideWorkspace(target, root, slashBase(api, cwd)),
+      hostWritable(root, target, api, cwd),
+      `${platform} ${root} -> ${target}`,
+    );
   }
 });
 
@@ -195,6 +220,11 @@ test("an unknown root or target is never treated as writable", () => {
   assert.equal(insideWorkspace("/home/wilder/.dsh/a.md", undefined), false);
   assert.equal(insideWorkspace("/a.md", ""), false);
   assert.equal(insideWorkspace("", CWD), false);
+  // A slash-rooted Windows target with no reported base cannot be placed: the
+  // Host resolves it against a root the pane has not been told, so the pane
+  // refuses rather than guessing the workspace root's drive.
+  assert.equal(insideWorkspace("/work/a.md", "C:\\work"), false);
+  assert.equal(insideWorkspace("/work/a.md", "C:\\work", ""), false);
 });
 
 test("the editor wires the Host-resolved workspace root into the writable decision", () => {
@@ -203,26 +233,33 @@ test("the editor wires the Host-resolved workspace root into the writable decisi
   // never from the session summary, and a relative address waits for it.
   const body = source.slice(source.indexOf("function EditorBody("));
   assert.match(body, /useWorkspaceRoot\(fileSessionId, face\)/);
-  assert.match(body, /insideWorkspace\(absPath, root\)/);
+  assert.match(body, /insideWorkspace\(absPath, root, resolveBase\)/);
+  assert.match(body, /const \{ root, resolveBase, settled: rootSettled \} = useWorkspaceRoot/);
   assert.match(body, /if \(!rootSettled\) return undefined;/);
   assert.doesNotMatch(body, /byId\[fileSessionId\]\?\.cwd/);
 });
 
 test("the Host answers a Windows / root with the drive root before the pane compares", () => {
-  // `path.win32.resolve` turns a raw `/` into the current drive's root, which
-  // is what the Host save gate resolves it to. The pane never sees the raw
-  // spelling, and accepts both a drive-qualified descendant of the resolved
-  // root and a slash-rooted child, which Windows also reads against that drive.
+  // `path.win32.resolve` turns a raw `/` into the root of the working
+  // directory's drive, which is what the Host save gate resolves it to. The
+  // pane never sees the raw spelling, and accepts both a drive-qualified
+  // descendant of the resolved root and a slash-rooted child, which Windows
+  // also reads against that drive.
   const WIN_CWD = "C:\\work";
-  assert.equal(win32Path.resolve(WIN_CWD, "/"), "C:\\");
+  const base = win32Path.resolve(WIN_CWD, "/");
+  assert.equal(base, "C:\\");
   const root = win32Path.resolve(WIN_CWD, "/");
   for (const target of ["C:\\file.txt", "c:\\FILE.TXT", "/file.txt"]) {
-    assert.equal(insideWorkspace(target, root), true, target);
-    assert.equal(insideWorkspace(target, root), hostWritable(root, target, win32Path, WIN_CWD), target);
+    assert.equal(insideWorkspace(target, root, base), true, target);
+    assert.equal(insideWorkspace(target, root, base), hostWritable(root, target, win32Path, WIN_CWD), target);
   }
-  // The route must hand back that resolved form, not the raw scope value.
+  // The base follows the working directory, not the workspace: a Host started
+  // on another drive reads the same slash-rooted target there and refuses it.
+  assert.equal(insideWorkspace("/file.txt", root, win32Path.resolve("D:\\service", "/")), false);
+  // The route must hand back both resolved answers, not the raw scope value.
   const hostHalf = readFileSync(join(ROOT, "index.js"), "utf8");
   assert.match(hostHalf, /workspaceRoot: path\.resolve\(scope\.workspaceRoot\)/);
+  assert.match(hostHalf, /resolveBase: path\.resolve\('\/'\)/);
 });
 
 test("a root resolved for one Session never stands in for another", async () => {
@@ -253,10 +290,11 @@ test("a root resolved for one Session never stands in for another", async () => 
 
   const first = render("A");
   assert.equal(first.root, undefined, "no root before the Host answers");
+  assert.equal(first.resolveBase, undefined, "no resolution base before the Host answers");
   assert.equal(first.settled, false, "an unanswered lookup has not settled");
-  answers.pop()({ ok: true, value: { workspaceRoot: "/work/projectA" } });
+  answers.pop()({ ok: true, value: { workspaceRoot: "/work/projectA", resolveBase: "/" } });
   await settle();
-  assert.deepEqual(render("A"), { root: "/work/projectA", settled: true });
+  assert.deepEqual(render("A"), { root: "/work/projectA", resolveBase: "/", settled: true });
 
   const forB = render("B");
   assert.equal(forB.root, undefined, "A's root must not answer for B");
@@ -266,7 +304,11 @@ test("a root resolved for one Session never stands in for another", async () => 
   assert.equal(render("B").root, undefined);
   answerForB({ ok: false, error: { code: "network", message: "unreachable" } });
   await settle();
-  assert.deepEqual(render("B"), { root: undefined, settled: true }, "a failed lookup settles with no root");
+  assert.deepEqual(
+    render("B"),
+    { root: undefined, resolveBase: undefined, settled: true },
+    "a failed lookup settles with no root",
+  );
 });
 
 test("the status line never reports an edit for a read-only target", () => {
