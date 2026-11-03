@@ -111,22 +111,45 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Collapse `.` and `..` segments so two spellings of one location compare
-     * equal. The Host resolves a path before it decides containment, so a plain
-     * string prefix test would call `a/../b` inside `a` when it is not.
+     * Whether a workspace root is spelled the way a Windows Host spells it: a
+     * drive letter, or a share root. The root comes from the Host, so its shape
+     * names the platform whose comparison the pane has to reproduce.
      */
-    function normalizeAbsolutePath(path) {
-      if (typeof path !== "string") return undefined;
-      const parts = [];
-      for (const segment of path.replace(/\\/g, "/").split("/")) {
+    function isWindowsRoot(root) {
+      return /^[A-Za-z]:/.test(root) || /^[/\\]{2}[^/\\]/.test(root);
+    }
+
+    /**
+     * Collapse one absolute path to its root and segments. `.` and `..` are
+     * resolved first, because the Host resolves before it compares. A root of
+     * `/` covers a POSIX path and also a Windows path under the current drive;
+     * a drive root carries no trailing separator, so `C:\` and `C:\x` line up.
+     * On Windows every segment folds to lower case, the way `path.win32.relative`
+     * compares; a POSIX path keeps its case.
+     */
+    function pathParts(path, windows) {
+      const slashed = path.replace(/\\/g, "/");
+      const drive = /^([A-Za-z]):(?:\/|$)/.exec(slashed);
+      const share = windows ? /^\/\/([^/]+)\/([^/]+)(?:\/|$)/.exec(slashed) : null;
+      let root = "/";
+      let rest = slashed;
+      if (drive !== null) {
+        root = `${drive[1].toLowerCase()}:`;
+        rest = slashed.slice(drive[0].length);
+      } else if (share !== null) {
+        root = `//${share[1].toLowerCase()}/${share[2].toLowerCase()}`;
+        rest = slashed.slice(share[0].length);
+      }
+      const segments = [];
+      for (const segment of rest.split("/")) {
         if (segment === "" || segment === ".") continue;
         if (segment === "..") {
-          parts.pop();
+          segments.pop();
           continue;
         }
-        parts.push(segment);
+        segments.push(windows ? segment.toLowerCase() : segment);
       }
-      return `/${parts.join("/")}`;
+      return { root, segments };
     }
 
     /**
@@ -135,23 +158,20 @@ window.__ModuleLoader__.load({
      * this to know which of the two it is showing.
      *
      * This reproduces the Host's own gate rather than approximating it: the
-     * Host resolves both sides and then compares them with the platform's
-     * `path.relative` (`fs.contains` in `dsh-fs-local`). Two consequences drive
-     * this shape. On Windows that comparison is case-insensitive, so a case
-     * variant of a path inside the workspace is still inside. And the root
-     * itself is refused, because the relative path there is empty, exactly as
-     * the save route refuses it.
+     * Host resolves both sides and compares them with the platform's
+     * `path.relative`, so the target must sit under the root and be a strict
+     * descendant of it. A root of `/` therefore contains every descendant, and
+     * the root itself is refused, exactly as the save route refuses it. The
+     * comparison folds case only when the root is spelled the Windows way,
+     * matching the platform whose `path.relative` the Host will use.
      */
     function insideWorkspace(path, root) {
       if (typeof root !== "string" || root === "" || typeof path !== "string" || path === "") return false;
-      const target = normalizeAbsolutePath(path);
-      const base = normalizeAbsolutePath(root);
-      if (target === undefined || base === undefined) return false;
-      const windowsFold = (value) => (/^\/[A-Za-z]:\//.test(value) ? value.toLowerCase() : value);
-      const inside = windowsFold(target);
-      const basePath = windowsFold(base);
-      if (inside === basePath) return false;
-      return basePath === "/" || inside.startsWith(`${basePath}/`);
+      const windows = isWindowsRoot(root);
+      const target = pathParts(path, windows);
+      const base = pathParts(root, windows);
+      if (target.root !== base.root || target.segments.length <= base.segments.length) return false;
+      return base.segments.every((segment, index) => target.segments[index] === segment);
     }
 
     /** The status word for one editor state. A read-only target never reports a pending edit. */
@@ -2137,21 +2157,25 @@ button.dse-qcName{cursor:pointer}
      */
     function useWorkspaceRoot(useSessions, sessionId, face) {
       const cwd = useSessions((sessions) => sessions.byId[sessionId]?.cwd);
-      const [fallback, setFallback] = React.useState(undefined);
+      const [lookup, setLookup] = React.useState(undefined);
       React.useEffect(() => {
         if (cwd !== undefined) return undefined;
         let live = true;
         face.workspaceRoot().then(
           (reply) => {
-            if (live && reply.ok === true && typeof reply.value.workspaceRoot === "string") setFallback(reply.value.workspaceRoot);
+            if (live && reply.ok === true && typeof reply.value.workspaceRoot === "string") {
+              setLookup({ sessionId, root: reply.value.workspaceRoot });
+            }
           },
           () => undefined,
         );
         return () => {
           live = false;
         };
-      }, [cwd, face]);
-      return cwd === undefined ? fallback : cwd;
+      }, [cwd, sessionId, face]);
+      if (cwd !== undefined) return cwd;
+      /** A root answered for another Session is not this Session's root. */
+      return lookup !== undefined && lookup.sessionId === sessionId ? lookup.root : undefined;
     }
 
     /**

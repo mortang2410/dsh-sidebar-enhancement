@@ -1,6 +1,6 @@
 /**
- * Contract test for the two pure helpers that decide which file the document
- * renderer opens and whether it may be saved.
+ * Contract test for the helpers that decide which file the document renderer
+ * opens and whether it may be saved.
  *
  * `client.js` is not an importable module: it is a browser bundle that calls
  * `window.__ModuleLoader__.load(...)` at top level, so `require` of it would
@@ -12,7 +12,7 @@
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, win32 as win32Path, posix as posixPath } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -35,13 +35,25 @@ function helper(name) {
 
 /**
  * The helpers depend on each other (`expandHomePrefix` joins with `childPath`,
- * `insideWorkspace` normalizes with `normalizeAbsolutePath`), so they are
+ * `insideWorkspace` splits with `pathParts` and `isWindowsRoot`), so they are
  * evaluated together in one scope rather than separately; a slice that lost a
  * dependency would throw here instead of silently testing nothing.
  */
-const { childPath, expandHomePrefix, insideWorkspace, normalizeAbsolutePath, editorStatusKey, editorHintKey } = new Function(
-  `${helper("childPath")}\n${helper("normalizeAbsolutePath")}\n${helper("expandHomePrefix")}\n${helper("insideWorkspace")}\n${helper("editorStatusKey")}\n${helper("editorHintKey")}\nreturn { childPath, expandHomePrefix, insideWorkspace, normalizeAbsolutePath, editorStatusKey, editorHintKey };`,
+const { childPath, expandHomePrefix, insideWorkspace, editorStatusKey, editorHintKey } = new Function(
+  `${helper("childPath")}\n${helper("isWindowsRoot")}\n${helper("pathParts")}\n${helper("expandHomePrefix")}\n${helper("insideWorkspace")}\n${helper("editorStatusKey")}\n${helper("editorHintKey")}\nreturn { childPath, expandHomePrefix, insideWorkspace, editorStatusKey, editorHintKey };`,
 )();
+
+/**
+ * The Host's save gate, from `resolveInside` in `index.js`: resolve both sides,
+ * then refuse an empty, absolute or `..`-prefixed relative path. The platform
+ * API is the one whose path syntax the pair uses. This is the oracle the pane
+ * must agree with, so the test compares against the real `node:path` functions
+ * rather than a second hand-written rule.
+ */
+function hostWritable(root, target, api) {
+  const relative = api.relative(api.resolve(root), api.resolve(target));
+  return relative !== "" && relative !== ".." && !relative.startsWith(`..${api.sep}`) && !api.isAbsolute(relative);
+}
 
 const HOME = "/home/wilder";
 const CWD = "/home/wilder/.dsh";
@@ -120,13 +132,44 @@ test("a Windows case variant of an in-workspace path stays writable", () => {
   assert.equal(insideWorkspace("c:\\users\\wilder\\.dshother\\a.md", "C:\\Users\\Wilder\\.dsh"), false);
 });
 
+test("a drive root and a share root are compared the way win32 compares them", () => {
+  // `path.win32.relative("C:\\", "c:\\users\\a.md")` is `users\\a.md`, so a
+  // workspace at a drive root contains everything on that drive, and a share
+  // root does the same for its share.
+  assert.equal(insideWorkspace("c:\\users\\wilder\\a.md", "C:\\"), true);
+  assert.equal(insideWorkspace("\\\\server\\share\\notes\\a.md", "\\\\SERVER\\Share"), true);
+  assert.equal(insideWorkspace("\\\\server\\other\\a.md", "\\\\SERVER\\Share"), false);
+  assert.equal(insideWorkspace("\\\\SERVER\\Share", "\\\\SERVER\\Share"), false);
+});
+
+test("the pane agrees with the Host's save gate on both path platforms", () => {
+  // The oracle is `node:path`, the same functions the Host save route uses.
+  const cases = [
+    ["posix", "/home/wilder/.dsh", "/home/wilder/.dsh/notes/a.md", posixPath],
+    ["posix", "/home/wilder/.dsh", "/home/wilder/Trash/a.md", posixPath],
+    ["posix", "/home/wilder/.dsh", "/home/wilder/.dshother/a.md", posixPath],
+    ["posix", "/home/wilder/.dsh", "/home/wilder/.dsh/../Trash/a.md", posixPath],
+    ["posix", "/home/wilder/.dsh", "/home/wilder/.dsh", posixPath],
+    ["posix", "/", "/home/wilder/a.md", posixPath],
+    ["win32", "C:\\Users\\Wilder\\.dsh", "c:\\users\\wilder\\.dsh\\notes\\a.md", win32Path],
+    ["win32", "C:\\Users\\Wilder\\.dsh", "D:\\notes\\a.md", win32Path],
+    ["win32", "C:\\", "c:\\users\\wilder\\a.md", win32Path],
+    ["win32", "\\\\SERVER\\Share", "\\\\server\\share\\notes\\a.md", win32Path],
+    ["win32", "\\\\SERVER\\Share", "\\\\server\\other\\a.md", win32Path],
+  ];
+  for (const [platform, root, target, api] of cases) {
+    assert.equal(insideWorkspace(target, root), hostWritable(root, target, api), `${platform} ${root} -> ${target}`);
+  }
+});
+
 test("a traversal segment cannot walk a path out of the workspace", () => {
   // The Host resolves before it tests containment, so the pane must agree.
   assert.equal(insideWorkspace(`${CWD}/../Trash/a.md`, CWD), false);
   assert.equal(insideWorkspace(`${CWD}/a/../../Trash/a.md`, CWD), false);
   assert.equal(insideWorkspace(`${CWD}/notes/../a.md`, CWD), true);
   assert.equal(insideWorkspace(`${CWD}/./notes/a.md`, CWD), true);
-  assert.equal(normalizeAbsolutePath(`${CWD}//a/./b/../c.md`), `${CWD}/a/c.md`);
+  assert.equal(insideWorkspace(`${CWD}//a/./b/../c.md`, CWD), true);
+  assert.equal(insideWorkspace(`${CWD}//a/./b/../c.md`, CWD), hostWritable(CWD, `${CWD}//a/./b/../c.md`, posixPath));
 });
 
 test("a root of / contains every descendant, the way the Host gate does", () => {
@@ -151,6 +194,48 @@ test("the editor wires the Host-resolved workspace root into the writable decisi
   assert.match(body, /useWorkspaceRoot\(useSessions, fileSessionId, face\)/);
   assert.match(body, /insideWorkspace\(absPath, root\)/);
   assert.doesNotMatch(body, /byId\[fileSessionId\]\?\.cwd/);
+});
+
+test("a root resolved for one Session never stands in for another", async () => {
+  // A mounted editor keeps its state across an address change, so a cached root
+  // from Session A must not make a path under A's workspace writable for B.
+  const cells = [];
+  let effectSlots = [];
+  let slot = 0;
+  const React = {
+    useState: (initial) => {
+      const at = slot++;
+      if (!(at in cells)) cells[at] = initial;
+      return [cells[at], (next) => { cells[at] = next; }];
+    },
+    useEffect: (fn) => { effectSlots.push(fn); },
+  };
+  const hook = new Function("React", `${helper("useWorkspaceRoot")}\nreturn useWorkspaceRoot;`)(React);
+  const sessions = { byId: { A: {}, B: {} } };
+  const useSessions = (selector) => selector(sessions);
+  const answers = [];
+  const face = { workspaceRoot: () => new Promise((resolve) => { answers.push(resolve); }) };
+  const render = (sessionId) => {
+    slot = 0;
+    effectSlots = [];
+    const root = hook(useSessions, sessionId, face);
+    for (const start of effectSlots) start();
+    return root;
+  };
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(render("A"), undefined, "no root before the Host answers");
+  answers.pop()({ ok: true, value: { workspaceRoot: "/work/projectA" } });
+  await settle();
+  assert.equal(render("A"), "/work/projectA");
+
+  assert.equal(render("B"), undefined, "A's root must not answer for B");
+  const answerForB = answers.pop();
+  // The stale root is the dangerous state, so check it before and after a failure.
+  assert.equal(render("B"), undefined);
+  answerForB({ ok: false, error: { code: "network", message: "unreachable" } });
+  await settle();
+  assert.equal(render("B"), undefined, "a failed lookup leaves B without a root");
 });
 
 test("the status line never reports an edit for a read-only target", () => {
