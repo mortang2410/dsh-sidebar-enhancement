@@ -46,12 +46,15 @@ const { childPath, expandHomePrefix, insideWorkspace, editorStatusKey, editorHin
 /**
  * The Host's save gate, from `resolveInside` in `index.js`: resolve both sides,
  * then refuse an empty, absolute or `..`-prefixed relative path. The platform
- * API is the one whose path syntax the pair uses. This is the oracle the pane
- * must agree with, so the test compares against the real `node:path` functions
- * rather than a second hand-written rule.
+ * API is the one whose path syntax the pair uses, and `cwd` stands in for the
+ * Host process working directory that `path.resolve` fills in for a path with no
+ * drive of its own. This is the oracle the pane must agree with, so the test
+ * compares against the real `node:path` functions rather than a second
+ * hand-written rule.
  */
-function hostWritable(root, target, api) {
-  const relative = api.relative(api.resolve(root), api.resolve(target));
+function hostWritable(root, target, api, cwd) {
+  const resolve = (value) => (cwd === undefined ? api.resolve(value) : api.resolve(cwd, value));
+  const relative = api.relative(resolve(root), resolve(target));
   return relative !== "" && relative !== ".." && !relative.startsWith(`..${api.sep}`) && !api.isAbsolute(relative);
 }
 
@@ -143,22 +146,30 @@ test("a drive root and a share root are compared the way win32 compares them", (
 });
 
 test("the pane agrees with the Host's save gate on both path platforms", () => {
-  // The oracle is `node:path`, the same functions the Host save route uses.
+  // The oracle is `node:path`, the same functions the Host save route uses. A
+  // Windows path with no drive of its own resolves against the process working
+  // directory, which `WIN_CWD` stands in for.
+  const WIN_CWD = "C:\\work";
   const cases = [
-    ["posix", "/home/wilder/.dsh", "/home/wilder/.dsh/notes/a.md", posixPath],
-    ["posix", "/home/wilder/.dsh", "/home/wilder/Trash/a.md", posixPath],
-    ["posix", "/home/wilder/.dsh", "/home/wilder/.dshother/a.md", posixPath],
-    ["posix", "/home/wilder/.dsh", "/home/wilder/.dsh/../Trash/a.md", posixPath],
-    ["posix", "/home/wilder/.dsh", "/home/wilder/.dsh", posixPath],
-    ["posix", "/", "/home/wilder/a.md", posixPath],
-    ["win32", "C:\\Users\\Wilder\\.dsh", "c:\\users\\wilder\\.dsh\\notes\\a.md", win32Path],
-    ["win32", "C:\\Users\\Wilder\\.dsh", "D:\\notes\\a.md", win32Path],
-    ["win32", "C:\\", "c:\\users\\wilder\\a.md", win32Path],
-    ["win32", "\\\\SERVER\\Share", "\\\\server\\share\\notes\\a.md", win32Path],
-    ["win32", "\\\\SERVER\\Share", "\\\\server\\other\\a.md", win32Path],
+    ["posix", "/home/wilder/.dsh", "/home/wilder/.dsh/notes/a.md", posixPath, undefined],
+    ["posix", "/home/wilder/.dsh", "/home/wilder/Trash/a.md", posixPath, undefined],
+    ["posix", "/home/wilder/.dsh", "/home/wilder/.dshother/a.md", posixPath, undefined],
+    ["posix", "/home/wilder/.dsh", "/home/wilder/.dsh/../Trash/a.md", posixPath, undefined],
+    ["posix", "/home/wilder/.dsh", "/home/wilder/.dsh", posixPath, undefined],
+    ["posix", "/", "/home/wilder/a.md", posixPath, undefined],
+    ["win32", "C:\\Users\\Wilder\\.dsh", "c:\\users\\wilder\\.dsh\\notes\\a.md", win32Path, WIN_CWD],
+    ["win32", "C:\\Users\\Wilder\\.dsh", "D:\\notes\\a.md", win32Path, WIN_CWD],
+    ["win32", "C:\\", "c:\\users\\wilder\\a.md", win32Path, WIN_CWD],
+    ["win32", "\\\\SERVER\\Share", "\\\\server\\share\\notes\\a.md", win32Path, WIN_CWD],
+    ["win32", "\\\\SERVER\\Share", "\\\\server\\other\\a.md", win32Path, WIN_CWD],
+    // The file pane builds a child of a `/` workspace as `/foo.txt`, which
+    // Windows reads relative to the current drive.
+    ["win32", "C:\\", "/foo.txt", win32Path, WIN_CWD],
+    ["win32", "C:\\Users\\Wilder\\.dsh", "/foo.txt", win32Path, WIN_CWD],
+    ["win32", "\\\\SERVER\\Share", "/foo.txt", win32Path, WIN_CWD],
   ];
-  for (const [platform, root, target, api] of cases) {
-    assert.equal(insideWorkspace(target, root), hostWritable(root, target, api), `${platform} ${root} -> ${target}`);
+  for (const [platform, root, target, api, cwd] of cases) {
+    assert.equal(insideWorkspace(target, root), hostWritable(root, target, api, cwd), `${platform} ${root} -> ${target}`);
   }
 });
 
@@ -200,12 +211,16 @@ test("the editor wires the Host-resolved workspace root into the writable decisi
 test("the Host answers a Windows / root with the drive root before the pane compares", () => {
   // `path.win32.resolve` turns a raw `/` into the current drive's root, which
   // is what the Host save gate resolves it to. The pane never sees the raw
-  // spelling, and accepts a drive-qualified descendant of the resolved root.
-  assert.equal(win32Path.resolve("C:\\work", "/"), "C:\\");
-  const root = win32Path.resolve("C:\\work", "/");
-  assert.equal(insideWorkspace("C:\\file.txt", root), true);
-  assert.equal(insideWorkspace("C:\\file.txt", root), hostWritable(root, "C:\\file.txt", win32Path));
-  // And the route must hand back that resolved form, not the raw scope value.
+  // spelling, and accepts both a drive-qualified descendant of the resolved
+  // root and a slash-rooted child, which Windows also reads against that drive.
+  const WIN_CWD = "C:\\work";
+  assert.equal(win32Path.resolve(WIN_CWD, "/"), "C:\\");
+  const root = win32Path.resolve(WIN_CWD, "/");
+  for (const target of ["C:\\file.txt", "c:\\FILE.TXT", "/file.txt"]) {
+    assert.equal(insideWorkspace(target, root), true, target);
+    assert.equal(insideWorkspace(target, root), hostWritable(root, target, win32Path, WIN_CWD), target);
+  }
+  // The route must hand back that resolved form, not the raw scope value.
   const hostHalf = readFileSync(join(ROOT, "index.js"), "utf8");
   assert.match(hostHalf, /workspaceRoot: path\.resolve\(scope\.workspaceRoot\)/);
 });

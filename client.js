@@ -122,13 +122,15 @@ window.__ModuleLoader__.load({
     /**
      * Collapse one absolute path to its root and segments. `.` and `..` are
      * resolved first, because the Host resolves before it compares. A root of
-     * `/` is the POSIX root; a Windows root always carries its drive letter or
-     * share, because the Host answers with the resolved form. A drive root
-     * carries no trailing separator, so `C:\` and `C:\x` line up. On Windows
-     * every segment folds to lower case, the way `path.win32.relative` compares;
-     * a POSIX path keeps its case.
+     * `/` is the POSIX root; a Windows root carries its drive letter or share,
+     * because the Host answers with the resolved form. A drive root carries no
+     * trailing separator, so `C:\` and `C:\x` line up. A single-leading-slash
+     * path on Windows is relative to the current drive, so `driveRoot` names the
+     * root it belongs to: the file pane builds children that way from a Session
+     * whose recorded workspace is `/`. On Windows every segment folds to lower
+     * case, the way `path.win32.relative` compares; a POSIX path keeps its case.
      */
-    function pathParts(path, windows) {
+    function pathParts(path, windows, driveRoot) {
       const slashed = path.replace(/\\/g, "/");
       const drive = /^([A-Za-z]):(?:\/|$)/.exec(slashed);
       const share = windows ? /^\/\/([^/]+)\/([^/]+)(?:\/|$)/.exec(slashed) : null;
@@ -140,6 +142,8 @@ window.__ModuleLoader__.load({
       } else if (share !== null) {
         root = `//${share[1].toLowerCase()}/${share[2].toLowerCase()}`;
         rest = slashed.slice(share[0].length);
+      } else if (driveRoot !== undefined) {
+        root = driveRoot;
       }
       const segments = [];
       for (const segment of rest.split("/")) {
@@ -164,13 +168,18 @@ window.__ModuleLoader__.load({
      * descendant of it. A root of `/` therefore contains every descendant, and
      * the root itself is refused, exactly as the save route refuses it. The
      * comparison folds case only when the root is spelled the Windows way,
-     * matching the platform whose `path.relative` the Host will use.
+     * matching the platform whose `path.relative` the Host will use, and a
+     * slash-rooted target under a drive root resolves against that drive, which
+     * is what `path.win32.resolve` does with it. A share root is not a drive, so
+     * there the slash-rooted target keeps the POSIX root and is refused, which
+     * is also what the Host does.
      */
     function insideWorkspace(path, root) {
       if (typeof root !== "string" || root === "" || typeof path !== "string" || path === "") return false;
       const windows = isWindowsRoot(root);
-      const target = pathParts(path, windows);
       const base = pathParts(root, windows);
+      const driveRoot = windows && /^[a-z]:$/.test(base.root) ? base.root : undefined;
+      const target = pathParts(path, windows, driveRoot);
       if (target.root !== base.root || target.segments.length <= base.segments.length) return false;
       return base.segments.every((segment, index) => target.segments[index] === segment);
     }
