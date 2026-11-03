@@ -205,6 +205,9 @@ test("the Host answers a Windows / root with the drive root before the pane comp
   const root = win32Path.resolve("C:\\work", "/");
   assert.equal(insideWorkspace("C:\\file.txt", root), true);
   assert.equal(insideWorkspace("C:\\file.txt", root), hostWritable(root, "C:\\file.txt", win32Path));
+  // And the route must hand back that resolved form, not the raw scope value.
+  const hostHalf = readFileSync(join(ROOT, "index.js"), "utf8");
+  assert.match(hostHalf, /workspaceRoot: path\.resolve\(scope\.workspaceRoot\)/);
 });
 
 test("a root resolved for one Session never stands in for another", async () => {
