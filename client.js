@@ -2249,7 +2249,10 @@ button.dse-qcName{cursor:pointer}
       const fileSessionId = parsed !== undefined && parsed.scope === "session" ? parsed.sessionId : sessionId;
       const face = React.useMemo(() => makeFace(fileSessionId), [makeFace, fileSessionId]);
       const { root, resolveBase, settled: rootSettled } = useWorkspaceRoot(fileSessionId, face);
-      const home = useHostHome();
+      // A contributed `hooks` source is bound into a selector hook: calling it
+      // with no selector hands `undefined` to the snapshot hook and crashes the
+      // body at mount, so the snapshot is selected explicitly here.
+      const home = useHostHome((value) => value);
       const absPath = React.useMemo(() => {
         if (parsed === undefined || parsed.scope !== "session") return undefined;
         const raw = expandHomePrefix(parsed.path.replace(/\\/g, "/"), home);
